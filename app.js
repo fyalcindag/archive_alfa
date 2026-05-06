@@ -139,26 +139,39 @@ function escapeXml(str) {
     .replace(/'/g, "&apos;");
 }
 
-function buildKml(name, jpgFileName, metadata) {
+function buildPlacemark(name, imgDataUri, metadata) {
   const { lat = 0, lon = 0 } = findCoordinates(metadata);
   const fields = Object.entries(metadata)
     .map(([k, v]) => `<b>${escapeXml(k)}:</b> ${escapeXml(v)}`)
     .join("<br/>");
-  const description = `<![CDATA[<img src="${jpgFileName}" width="400" /><br/>${fields}]]>`;
-
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
-  <Document>
-    <name>${escapeXml(name)}</name>
-    <Placemark>
+  const img = imgDataUri ? `<img src="${imgDataUri}" width="400" /><br/>` : "";
+  const description = `<![CDATA[${img}${fields}]]>`;
+  return `    <Placemark>
       <name>${escapeXml(name)}</name>
       <description>${description}</description>
       <Point>
         <coordinates>${lon},${lat},0</coordinates>
       </Point>
-    </Placemark>
+    </Placemark>`;
+}
+
+function wrapKml(docName, placemarksXml) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>${escapeXml(docName)}</name>
+${placemarksXml}
   </Document>
 </kml>`;
+}
+
+function fileToDataUri(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
 }
 
 async function readFrame(subDirHandle) {
@@ -240,40 +253,24 @@ els.createKml.addEventListener("click", async () => {
 
     const outDirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
 
+    const placemarks = [];
     let count = 0;
     for (const frame of state.frames) {
-      const kml = buildKml(`${state.missionId}/${frame.frameId}`, frame.jpgFile.name, frame.metadata);
-      const zip = new JSZip();
-      zip.file("doc.kml", kml);
-      zip.file(frame.jpgFile.name, await frame.jpgFile.arrayBuffer());
-      const blob = await zip.generateAsync({ type: "blob", mimeType: "application/vnd.google-earth.kmz" });
+      const dataUri = await fileToDataUri(frame.jpgFile);
+      const placemark = buildPlacemark(frame.frameId, dataUri, frame.metadata);
+      placemarks.push(placemark);
 
-      const fileName = `${state.missionId}_${frame.frameId}.kmz`;
+      const kml = wrapKml(`${state.missionId}/${frame.frameId}`, placemark);
+      const fileName = `${state.missionId}_${frame.frameId}.kml`;
       const fileHandle = await outDirHandle.getFileHandle(fileName, { create: true });
       const writable = await fileHandle.createWritable();
-      await writable.write(blob);
+      await writable.write(new Blob([kml], { type: "application/vnd.google-earth.kml+xml" }));
       await writable.close();
 
       frame.kmzName = fileName;
       count++;
-      setStatus(`Created ${count}/${state.frames.length} KMZ files…`, "ok");
+      setStatus(`Created ${count}/${state.frames.length} KML files…`, "ok");
     }
-
-    const combinedName = `${state.missionId}_combined.kmz`;
-    const combinedZip = new JSZip();
-    const placemarks = state.frames.map((frame) => {
-      const { lat = 0, lon = 0 } = findCoordinates(frame.metadata);
-      const imgPath = `${frame.frameId}/${frame.jpgFile.name}`;
-      const fields = Object.entries(frame.metadata)
-        .map(([k, v]) => `<b>${escapeXml(k)}:</b> ${escapeXml(v)}`)
-        .join("<br/>");
-      const desc = `<![CDATA[<img src="${imgPath}" width="400" /><br/>${fields}]]>`;
-      return `    <Placemark>
-      <name>${escapeXml(frame.frameId)}</name>
-      <description>${desc}</description>
-      <Point><coordinates>${lon},${lat},0</coordinates></Point>
-    </Placemark>`;
-    });
 
     let centerPlacemark = "";
     if (state.centerOfMission) {
@@ -284,27 +281,16 @@ els.createKml.addEventListener("click", async () => {
     </Placemark>\n`;
     }
 
-    const combinedKml = `<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
-  <Document>
-    <name>${escapeXml(state.missionId)}</name>
-${centerPlacemark}${placemarks.join("\n")}
-  </Document>
-</kml>`;
-
-    combinedZip.file("doc.kml", combinedKml);
-    for (const frame of state.frames) {
-      combinedZip.file(`${frame.frameId}/${frame.jpgFile.name}`, await frame.jpgFile.arrayBuffer());
-    }
-    const combinedBlob = await combinedZip.generateAsync({ type: "blob", mimeType: "application/vnd.google-earth.kmz" });
+    const combinedName = `${state.missionId}_combined.kml`;
+    const combinedKml = wrapKml(state.missionId, centerPlacemark + placemarks.join("\n"));
     const combinedHandle = await outDirHandle.getFileHandle(combinedName, { create: true });
     const cw = await combinedHandle.createWritable();
-    await cw.write(combinedBlob);
+    await cw.write(new Blob([combinedKml], { type: "application/vnd.google-earth.kml+xml" }));
     await cw.close();
     state.combinedKmzName = combinedName;
 
-    setInfo(els.kmlInfo, `Saved ${count} per-frame KMZ(s) and combined "${combinedName}" into "${outDirHandle.name}".`, "ok");
-    setStatus("All KMZs created.", "ok");
+    setInfo(els.kmlInfo, `Saved ${count} per-frame KML(s) and combined "${combinedName}" into "${outDirHandle.name}".`, "ok");
+    setStatus("All KMLs created.", "ok");
   } catch (err) {
     if (err.name === "AbortError") return;
     setStatus("Failed to create KMZs: " + err.message, "err");
