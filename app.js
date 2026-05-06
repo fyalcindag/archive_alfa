@@ -1,7 +1,9 @@
 const state = {
   missionId: null,
   missionDirHandle: null,
-  frames: [], // [{ frameId, xmlFile, jpgFile, metadata, kmzName }]
+  frames: [], // [{ frameId, frameNumber, xmlFile, jpgFile, metadata, kmzName }]
+  centerOfMission: null, // "lat,lon" string or null
+  combinedKmzName: null,
 };
 
 const els = {
@@ -78,6 +80,44 @@ function parseMetadata(xmlText) {
   return out;
 }
 
+function frameNumberFromName(name) {
+  const m = name.match(/^(\d+)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function getMetadataField(metadata, fieldName) {
+  const target = fieldName.toLowerCase();
+  for (const [key, value] of Object.entries(metadata)) {
+    const lastSegment = key.split(".").pop().replace(/^@/, "").toLowerCase();
+    if (lastSegment === target) return value;
+  }
+  return null;
+}
+
+function computeCenterOfMission(frames) {
+  const numbered = frames.filter((f) => f.frameNumber !== null);
+  if (numbered.length < 1) return null;
+
+  const sorted = [...numbered].sort((a, b) => a.frameNumber - b.frameNumber);
+  const minFrame = sorted[0];
+  const maxFrame = sorted[sorted.length - 1];
+
+  const corners = [
+    [getMetadataField(minFrame.metadata, "UpperLeftLatitude"), getMetadataField(minFrame.metadata, "UpperLeftLongitude")],
+    [getMetadataField(minFrame.metadata, "UpperRightLatitude"), getMetadataField(minFrame.metadata, "UpperRightLongitude")],
+    [getMetadataField(maxFrame.metadata, "LowerLeftLatitude"), getMetadataField(maxFrame.metadata, "LowerLeftLongitude")],
+    [getMetadataField(maxFrame.metadata, "LowerRightLatitude"), getMetadataField(maxFrame.metadata, "LowerRightLongitude")],
+  ];
+
+  const lats = corners.map(([la]) => parseFloat(la));
+  const lons = corners.map(([, lo]) => parseFloat(lo));
+  if (lats.some(isNaN) || lons.some(isNaN)) return null;
+
+  const lat = lats.reduce((a, b) => a + b, 0) / 4;
+  const lon = lons.reduce((a, b) => a + b, 0) / 4;
+  return { lat, lon };
+}
+
 function findCoordinates(metadata) {
   let lat, lon;
   for (const [key, value] of Object.entries(metadata)) {
@@ -141,6 +181,7 @@ async function readFrame(subDirHandle) {
 
   return {
     frameId: subDirHandle.name,
+    frameNumber: frameNumberFromName(subDirHandle.name),
     xmlFile,
     jpgFile,
     metadata,
@@ -154,6 +195,8 @@ els.selectFolder.addEventListener("click", async () => {
     state.missionDirHandle = dirHandle;
     state.missionId = dirHandle.name;
     state.frames = [];
+    state.centerOfMission = null;
+    state.combinedKmzName = null;
 
     const skipped = [];
     for await (const [name, handle] of dirHandle.entries()) {
@@ -170,7 +213,13 @@ els.selectFolder.addEventListener("click", async () => {
       return;
     }
 
+    state.frames.sort((a, b) => (a.frameNumber ?? Infinity) - (b.frameNumber ?? Infinity));
+    const center = computeCenterOfMission(state.frames);
+    state.centerOfMission = center ? `${center.lat.toFixed(8)},${center.lon.toFixed(8)}` : null;
+
     let msg = `Mission: ${state.missionId} — ${state.frames.length} frame(s) detected.`;
+    if (state.centerOfMission) msg += ` Center: ${state.centerOfMission}.`;
+    else msg += ` Center: not computed (missing corner fields).`;
     if (skipped.length) msg += ` Skipped: ${skipped.join(", ")}`;
     setInfo(els.folderInfo, msg, "ok");
     els.createKml.disabled = false;
@@ -210,7 +259,51 @@ els.createKml.addEventListener("click", async () => {
       setStatus(`Created ${count}/${state.frames.length} KMZ files…`, "ok");
     }
 
-    setInfo(els.kmlInfo, `Saved ${count} KMZ file(s) into "${outDirHandle.name}".`, "ok");
+    const combinedName = `${state.missionId}_combined.kmz`;
+    const combinedZip = new JSZip();
+    const placemarks = state.frames.map((frame) => {
+      const { lat = 0, lon = 0 } = findCoordinates(frame.metadata);
+      const imgPath = `${frame.frameId}/${frame.jpgFile.name}`;
+      const fields = Object.entries(frame.metadata)
+        .map(([k, v]) => `<b>${escapeXml(k)}:</b> ${escapeXml(v)}`)
+        .join("<br/>");
+      const desc = `<![CDATA[<img src="${imgPath}" width="400" /><br/>${fields}]]>`;
+      return `    <Placemark>
+      <name>${escapeXml(frame.frameId)}</name>
+      <description>${desc}</description>
+      <Point><coordinates>${lon},${lat},0</coordinates></Point>
+    </Placemark>`;
+    });
+
+    let centerPlacemark = "";
+    if (state.centerOfMission) {
+      const [clat, clon] = state.centerOfMission.split(",");
+      centerPlacemark = `    <Placemark>
+      <name>Center of Mission</name>
+      <Point><coordinates>${clon},${clat},0</coordinates></Point>
+    </Placemark>\n`;
+    }
+
+    const combinedKml = `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>${escapeXml(state.missionId)}</name>
+${centerPlacemark}${placemarks.join("\n")}
+  </Document>
+</kml>`;
+
+    combinedZip.file("doc.kml", combinedKml);
+    for (const frame of state.frames) {
+      combinedZip.file(`${frame.frameId}/${frame.jpgFile.name}`, await frame.jpgFile.arrayBuffer());
+    }
+    const combinedBlob = await combinedZip.generateAsync({ type: "blob", mimeType: "application/vnd.google-earth.kmz" });
+    const combinedHandle = await outDirHandle.getFileHandle(combinedName, { create: true });
+    const cw = await combinedHandle.createWritable();
+    await cw.write(combinedBlob);
+    await cw.close();
+    state.combinedKmzName = combinedName;
+
+    setInfo(els.kmlInfo, `Saved ${count} per-frame KMZ(s) and combined "${combinedName}" into "${outDirHandle.name}".`, "ok");
     setStatus("All KMZs created.", "ok");
   } catch (err) {
     if (err.name === "AbortError") return;
@@ -218,7 +311,7 @@ els.createKml.addEventListener("click", async () => {
   }
 });
 
-const BASE_COLUMNS = ["MissionID", "FrameID", "kml_path", "created_at"];
+const BASE_COLUMNS = ["MissionID", "FrameID", "centerOfMission", "kml_path", "created_at"];
 
 els.importExcel.addEventListener("click", async () => {
   try {
@@ -252,6 +345,7 @@ els.importExcel.addEventListener("click", async () => {
     const newRows = state.frames.map((frame) => ({
       MissionID: state.missionId,
       FrameID: frame.frameId,
+      centerOfMission: state.centerOfMission || "",
       kml_path: frame.kmzName || "",
       created_at: new Date().toISOString(),
       ...frame.metadata,
