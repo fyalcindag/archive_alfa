@@ -36,10 +36,61 @@ function checkApiSupport() {
   return true;
 }
 
-// Stub: parse XML and return metadata object. Will be filled in once
-// the user provides an example XML schema.
 function parseMetadata(xmlText) {
-  return {};
+  const doc = new DOMParser().parseFromString(xmlText, "application/xml");
+  const parseError = doc.querySelector("parsererror");
+  if (parseError) throw new Error("Invalid XML: " + parseError.textContent.split("\n")[0]);
+
+  const out = {};
+  const counters = new Map();
+
+  function visit(node, path) {
+    for (const attr of node.attributes || []) {
+      const key = path ? `${path}.@${attr.name}` : `@${attr.name}`;
+      assign(out, key, attr.value);
+    }
+
+    const elementChildren = Array.from(node.children);
+    if (elementChildren.length === 0) {
+      const text = (node.textContent || "").trim();
+      if (text) assign(out, path, text);
+      return;
+    }
+
+    const siblingTags = elementChildren.map((c) => c.tagName);
+    for (const child of elementChildren) {
+      const tag = child.tagName;
+      const repeated = siblingTags.filter((t) => t === tag).length > 1;
+      let segment = tag;
+      if (repeated) {
+        const counterKey = path + "/" + tag;
+        const i = counters.get(counterKey) ?? 0;
+        counters.set(counterKey, i + 1);
+        segment = `${tag}[${i}]`;
+      }
+      visit(child, path ? `${path}.${segment}` : segment);
+    }
+  }
+
+  function assign(target, key, value) {
+    if (target[key] === undefined) target[key] = value;
+    else target[key] += " | " + value;
+  }
+
+  if (doc.documentElement) visit(doc.documentElement, doc.documentElement.tagName);
+  return out;
+}
+
+function findCoordinates(metadata) {
+  let lat, lon;
+  for (const [key, value] of Object.entries(metadata)) {
+    const k = key.toLowerCase();
+    const num = parseFloat(value);
+    if (Number.isNaN(num)) continue;
+    if (lat === undefined && /(^|[^a-z])lat(itude)?($|[^a-z])/.test(k)) lat = num;
+    else if (lon === undefined && /(^|[^a-z])(lon|lng|longitude)($|[^a-z])/.test(k)) lon = num;
+  }
+  return { lat, lon };
 }
 
 els.selectFolder.addEventListener("click", async () => {
@@ -84,10 +135,12 @@ els.selectFolder.addEventListener("click", async () => {
 });
 
 function buildKml(jpgFileName, metadata) {
-  const lat = metadata.latitude ?? 0;
-  const lon = metadata.longitude ?? 0;
-  const name = metadata.name ?? state.folderName ?? "Placemark";
-  const description = `<![CDATA[<img src="${jpgFileName}" width="400" />]]>`;
+  const { lat = 0, lon = 0 } = findCoordinates(metadata);
+  const name = state.folderName || "Placemark";
+  const fields = Object.entries(metadata)
+    .map(([k, v]) => `<b>${escapeXml(k)}:</b> ${escapeXml(v)}`)
+    .join("<br/>");
+  const description = `<![CDATA[<img src="${jpgFileName}" width="400" /><br/>${fields}]]>`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
