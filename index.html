@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Archive Alfa</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>Archive Alfa</h1>
+      <p class="subtitle">Select a folder containing an XML and a JPG, then build a KMZ and log it to Excel.</p>
+    </header>
+
+    <section class="card">
+      <h2>1. Select folder</h2>
+      <button id="btn-select-folder" class="btn primary">Select folder</button>
+      <div id="folder-info" class="info"></div>
+    </section>
+
+    <section class="card">
+      <h2>2. Create KML</h2>
+      <button id="btn-create-kml" class="btn" disabled>Create KML</button>
+      <div id="kml-info" class="info"></div>
+    </section>
+
+    <section class="card">
+      <h2>3. Import metadata to Excel</h2>
+      <button id="btn-import-excel" class="btn" disabled>Import metadata to Excel</button>
+      <div id="excel-info" class="info"></div>
+    </section>
+
+    <div id="status" class="status" aria-live="polite"></div>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
