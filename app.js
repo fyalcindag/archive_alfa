@@ -1,10 +1,7 @@
 const state = {
-  folderName: null,
-  xmlFile: null,
-  jpgFile: null,
-  metadata: {},
-  kmzPath: null,
-  kmzName: null,
+  missionId: null,
+  missionDirHandle: null,
+  frames: [], // [{ frameId, xmlFile, jpgFile, metadata, kmzName }]
 };
 
 const els = {
@@ -28,7 +25,7 @@ function setInfo(el, msg, kind = "") {
 }
 
 function checkApiSupport() {
-  if (!window.showDirectoryPicker || !window.showSaveFilePicker || !window.showOpenFilePicker) {
+  if (!window.showDirectoryPicker || !window.showOpenFilePicker) {
     setStatus("This app requires Chrome or Edge (File System Access API).", "err");
     els.selectFolder.disabled = true;
     return false;
@@ -93,50 +90,17 @@ function findCoordinates(metadata) {
   return { lat, lon };
 }
 
-els.selectFolder.addEventListener("click", async () => {
-  try {
-    const dirHandle = await window.showDirectoryPicker();
-    state.folderName = dirHandle.name;
+function escapeXml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
 
-    let xmlHandle = null;
-    let jpgHandle = null;
-
-    for await (const [name, handle] of dirHandle.entries()) {
-      if (handle.kind !== "file") continue;
-      const lower = name.toLowerCase();
-      if (lower.endsWith(".xml")) xmlHandle = handle;
-      else if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) jpgHandle = handle;
-    }
-
-    if (!xmlHandle || !jpgHandle) {
-      setInfo(els.folderInfo, "Folder must contain one .xml and one .jpg file.", "err");
-      els.createKml.disabled = true;
-      els.importExcel.disabled = true;
-      return;
-    }
-
-    state.xmlFile = await xmlHandle.getFile();
-    state.jpgFile = await jpgHandle.getFile();
-    const xmlText = await state.xmlFile.text();
-    state.metadata = parseMetadata(xmlText);
-
-    setInfo(
-      els.folderInfo,
-      `Folder: ${state.folderName} — XML: ${state.xmlFile.name}, JPG: ${state.jpgFile.name}`,
-      "ok"
-    );
-    els.createKml.disabled = false;
-    els.importExcel.disabled = false;
-    setStatus("Folder loaded.", "ok");
-  } catch (err) {
-    if (err.name === "AbortError") return;
-    setStatus("Failed to read folder: " + err.message, "err");
-  }
-});
-
-function buildKml(jpgFileName, metadata) {
+function buildKml(name, jpgFileName, metadata) {
   const { lat = 0, lon = 0 } = findCoordinates(metadata);
-  const name = state.folderName || "Placemark";
   const fields = Object.entries(metadata)
     .map(([k, v]) => `<b>${escapeXml(k)}:</b> ${escapeXml(v)}`)
     .join("<br/>");
@@ -157,54 +121,112 @@ function buildKml(jpgFileName, metadata) {
 </kml>`;
 }
 
-function escapeXml(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
+async function readFrame(subDirHandle) {
+  let xmlHandle = null;
+  let jpgHandle = null;
+
+  for await (const [name, handle] of subDirHandle.entries()) {
+    if (handle.kind !== "file") continue;
+    const lower = name.toLowerCase();
+    if (lower.endsWith("meta.xml")) xmlHandle = handle;
+    else if ((lower.endsWith(".jpg") || lower.endsWith(".jpeg")) && !jpgHandle) jpgHandle = handle;
+  }
+
+  if (!xmlHandle || !jpgHandle) return null;
+
+  const xmlFile = await xmlHandle.getFile();
+  const jpgFile = await jpgHandle.getFile();
+  const xmlText = await xmlFile.text();
+  const metadata = parseMetadata(xmlText);
+
+  return {
+    frameId: subDirHandle.name,
+    xmlFile,
+    jpgFile,
+    metadata,
+    kmzName: null,
+  };
 }
 
-els.createKml.addEventListener("click", async () => {
+els.selectFolder.addEventListener("click", async () => {
   try {
-    if (!state.xmlFile || !state.jpgFile) {
-      setStatus("Select a folder first.", "err");
+    const dirHandle = await window.showDirectoryPicker();
+    state.missionDirHandle = dirHandle;
+    state.missionId = dirHandle.name;
+    state.frames = [];
+
+    const skipped = [];
+    for await (const [name, handle] of dirHandle.entries()) {
+      if (handle.kind !== "directory") continue;
+      const frame = await readFrame(handle);
+      if (frame) state.frames.push(frame);
+      else skipped.push(name);
+    }
+
+    if (state.frames.length === 0) {
+      setInfo(els.folderInfo, `No valid frames found in "${state.missionId}". Each subfolder must contain a JPG and a *meta.xml file.`, "err");
+      els.createKml.disabled = true;
+      els.importExcel.disabled = true;
       return;
     }
 
-    const jpgName = state.jpgFile.name;
-    const kmlText = buildKml(jpgName, state.metadata);
-
-    const zip = new JSZip();
-    zip.file("doc.kml", kmlText);
-    zip.file(jpgName, await state.jpgFile.arrayBuffer());
-    const blob = await zip.generateAsync({ type: "blob", mimeType: "application/vnd.google-earth.kmz" });
-
-    const suggestedName = (state.folderName || "archive") + ".kmz";
-    const handle = await window.showSaveFilePicker({
-      suggestedName,
-      types: [{ description: "KMZ file", accept: { "application/vnd.google-earth.kmz": [".kmz"] } }],
-    });
-
-    const writable = await handle.createWritable();
-    await writable.write(blob);
-    await writable.close();
-
-    state.kmzName = handle.name;
-    state.kmzPath = handle.name; // browsers do not expose absolute path; we keep the file name
-    setInfo(els.kmlInfo, `Saved as ${handle.name}`, "ok");
-    setStatus("KMZ created.", "ok");
+    let msg = `Mission: ${state.missionId} — ${state.frames.length} frame(s) detected.`;
+    if (skipped.length) msg += ` Skipped: ${skipped.join(", ")}`;
+    setInfo(els.folderInfo, msg, "ok");
+    els.createKml.disabled = false;
+    els.importExcel.disabled = false;
+    setStatus("Mission folder loaded.", "ok");
   } catch (err) {
     if (err.name === "AbortError") return;
-    setStatus("Failed to create KMZ: " + err.message, "err");
+    setStatus("Failed to read folder: " + err.message, "err");
   }
 });
 
-const EMPTY_COLUMNS = ["folder", "xml_file", "jpg_file", "kml_path", "created_at"];
+els.createKml.addEventListener("click", async () => {
+  try {
+    if (state.frames.length === 0) {
+      setStatus("Select a mission folder first.", "err");
+      return;
+    }
+
+    const outDirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+
+    let count = 0;
+    for (const frame of state.frames) {
+      const kml = buildKml(`${state.missionId}/${frame.frameId}`, frame.jpgFile.name, frame.metadata);
+      const zip = new JSZip();
+      zip.file("doc.kml", kml);
+      zip.file(frame.jpgFile.name, await frame.jpgFile.arrayBuffer());
+      const blob = await zip.generateAsync({ type: "blob", mimeType: "application/vnd.google-earth.kmz" });
+
+      const fileName = `${state.missionId}_${frame.frameId}.kmz`;
+      const fileHandle = await outDirHandle.getFileHandle(fileName, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+
+      frame.kmzName = fileName;
+      count++;
+      setStatus(`Created ${count}/${state.frames.length} KMZ files…`, "ok");
+    }
+
+    setInfo(els.kmlInfo, `Saved ${count} KMZ file(s) into "${outDirHandle.name}".`, "ok");
+    setStatus("All KMZs created.", "ok");
+  } catch (err) {
+    if (err.name === "AbortError") return;
+    setStatus("Failed to create KMZs: " + err.message, "err");
+  }
+});
+
+const BASE_COLUMNS = ["MissionID", "FrameID", "kml_path", "created_at"];
 
 els.importExcel.addEventListener("click", async () => {
   try {
+    if (state.frames.length === 0) {
+      setStatus("Select a mission folder first.", "err");
+      return;
+    }
+
     const [fileHandle] = await window.showOpenFilePicker({
       types: [{ description: "Excel file", accept: { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"] } }],
     });
@@ -227,30 +249,29 @@ els.importExcel.addEventListener("click", async () => {
       rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
     }
 
-    const newRow = {
-      folder: state.folderName || "",
-      xml_file: state.xmlFile ? state.xmlFile.name : "",
-      jpg_file: state.jpgFile ? state.jpgFile.name : "",
-      kml_path: state.kmzName || "",
+    const newRows = state.frames.map((frame) => ({
+      MissionID: state.missionId,
+      FrameID: frame.frameId,
+      kml_path: frame.kmzName || "",
       created_at: new Date().toISOString(),
-      ...state.metadata,
-    };
+      ...frame.metadata,
+    }));
 
-    rows.push(newRow);
+    const allRows = [...rows, ...newRows];
+    const headers = Array.from(
+      new Set([...BASE_COLUMNS, ...allRows.flatMap((r) => Object.keys(r))])
+    );
 
-    const headers = rows.length > 0
-      ? Array.from(new Set([...EMPTY_COLUMNS, ...Object.keys(newRow), ...rows.flatMap((r) => Object.keys(r))]))
-      : EMPTY_COLUMNS;
+    const newSheet = XLSX.utils.json_to_sheet(allRows, { header: headers });
 
-    const newSheet = XLSX.utils.json_to_sheet(rows, { header: headers });
-
-    if (state.kmzName) {
-      const kmlPathCol = headers.indexOf("kml_path");
-      if (kmlPathCol >= 0) {
-        const rowIdx = rows.length; // 1-based header + rows.length = last row index
+    const kmlPathCol = headers.indexOf("kml_path");
+    if (kmlPathCol >= 0) {
+      for (let i = 0; i < newRows.length; i++) {
+        const rowIdx = rows.length + i + 1; // +1 for header row
         const cellRef = XLSX.utils.encode_cell({ c: kmlPathCol, r: rowIdx });
-        if (newSheet[cellRef]) {
-          newSheet[cellRef].l = { Target: state.kmzName, Tooltip: "Open KMZ in default app (Google Earth)" };
+        const linkTarget = newRows[i].kml_path;
+        if (newSheet[cellRef] && linkTarget) {
+          newSheet[cellRef].l = { Target: linkTarget, Tooltip: "Open KMZ in default app (Google Earth)" };
         }
       }
     }
@@ -263,7 +284,7 @@ els.importExcel.addEventListener("click", async () => {
     await writable.write(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
     await writable.close();
 
-    setInfo(els.excelInfo, `Updated ${fileHandle.name} — ${rows.length} row(s).`, "ok");
+    setInfo(els.excelInfo, `Updated ${fileHandle.name} — added ${newRows.length} row(s), total ${allRows.length}.`, "ok");
     setStatus("Excel updated.", "ok");
   } catch (err) {
     if (err.name === "AbortError") return;
